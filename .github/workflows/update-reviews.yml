@@ -1,0 +1,78 @@
+name: Обновление отзывов
+
+# Запускается каждый день, но реально обновляет данные только если с последнего
+# УСПЕШНОГО обновления прошло >= 7 дней. Логика:
+#  - успех  -> маркер state/last_success = сегодня -> следующие 6 дней пропуск (раз в неделю)
+#  - неудача -> маркер не трогаем -> назавтра снова "пора" -> повтор каждый день, пока не заработает
+on:
+  schedule:
+    - cron: "32 7 * * *"      # ежедневно 07:32 UTC (10:32 МСК)
+  workflow_dispatch:          # ручной запуск (кнопка Run workflow)
+    inputs:
+      force:
+        description: "Обновить сейчас, игнорируя недельную паузу"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write             # чтобы бот мог запушить reviews.json
+
+concurrency:
+  group: update-reviews
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Пора ли обновлять
+        id: gate
+        run: |
+          FORCE="${{ github.event.inputs.force }}"
+          DUE=true
+          if [ "$FORCE" = "true" ]; then
+            echo "Форсированный ручной запуск — обновляем."
+          elif [ -f state/last_success ]; then
+            LAST=$(cat state/last_success)
+            LAST_TS=$(date -d "$LAST" +%s 2>/dev/null || echo 0)
+            DAYS=$(( ( $(date +%s) - LAST_TS ) / 86400 ))
+            echo "Последнее успешное обновление: $LAST ($DAYS дн. назад)."
+            [ "$DAYS" -ge 7 ] && DUE=true || DUE=false
+          else
+            echo "Маркера успеха нет — первый запуск."
+          fi
+          echo "Итог: обновлять = $DUE"
+          echo "due=$DUE" >> "$GITHUB_OUTPUT"
+
+      - name: Python
+        if: steps.gate.outputs.due == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Зависимости
+        if: steps.gate.outputs.due == 'true'
+        run: pip install --quiet requests beautifulsoup4
+
+      - name: Скрапинг Яндекс Карт → reviews.json
+        if: steps.gate.outputs.due == 'true'
+        run: python scripts/scrape_reviews.py --out reviews.json
+
+      # Выполнится только если скрапинг выше прошёл успешно (success()).
+      # При неудаче скрапинга шаг пропускается, маркер не обновляется -> завтра повтор.
+      - name: Зафиксировать успех и запушить
+        if: steps.gate.outputs.due == 'true' && success()
+        run: |
+          date -u +%Y-%m-%d > state/last_success
+          if git diff --quiet -- reviews.json state/last_success; then
+            echo "Данные не изменились — коммит не нужен."
+            exit 0
+          fi
+          git config user.name "reviews-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add reviews.json state/last_success
+          git commit -m "Автообновление отзывов $(date -u +%Y-%m-%d)"
+          git push
+          echo "Запушено."
